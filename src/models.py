@@ -38,10 +38,16 @@ PROCESS_DURATION = {
 class Equipment:
     equip_id: str
     process: str
-    position: str  # node name in graph
+    position: str
+    current_lot: Optional[str] = None   # None = 유휴, str = 점유 중인 LOT ID
+
+    @property
+    def is_occupied(self) -> bool:
+        return self.current_lot is not None
 
     def __repr__(self):
-        return f"Equipment({self.equip_id}, {self.process}, pos={self.position})"
+        occ = self.current_lot or "free"
+        return f"Equipment({self.equip_id}, {self.process}, pos={self.position}, occ={occ})"
 
 
 @dataclass
@@ -52,7 +58,8 @@ class OHT:
     total_distance: float = 0.0
     task_count: int = 0
     current_lot: Optional[str] = None
-    current_task: Optional[dict] = None  # {lot_id, from_node, to_node, ticks_remaining}
+    current_task: Optional[dict] = None
+    recovery_ticks: int = 0             # 장애 후 복구까지 남은 tick
 
     def __repr__(self):
         return (f"OHT({self.oht_id}, pos={self.position}, "

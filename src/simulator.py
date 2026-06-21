@@ -40,7 +40,7 @@ class AMHSSimulator:
 
         self.scheduler = Scheduler(self.graph, self.ohts, failover_prob=failover_prob)
 
-        # LOT별 공정 → 설비 배정 (분산 처리)
+        # LOT별 공정 → 설비 배정 (분산)
         equip_by_proc: Dict[str, List[str]] = {}
         for eid, proc in EQUIPMENT_PROCESS.items():
             equip_by_proc.setdefault(proc, []).append(eid)
@@ -51,6 +51,9 @@ class AMHSSimulator:
             pool = sorted(equip_by_proc[proc])
             for i, lot_id in enumerate(lot_ids):
                 self._equip_assignment.setdefault(lot_id, {})[proc] = pool[i % len(pool)]
+
+        # 설비별 대기 큐: 설비가 점유 중일 때 운송 대기 중인 LOT ID 목록
+        self._equip_queue: Dict[str, List[str]] = {eid: [] for eid in self.equipments}
 
     # ------------------------------------------------------------------ #
     #  메인 루프                                                           #
@@ -64,7 +67,6 @@ class AMHSSimulator:
         self.graph.print_graph()
         self._print_equip_assignment()
 
-        # 초기 운송 요청
         for lot in self.lots.values():
             self._request_transport(lot)
 
@@ -72,42 +74,71 @@ class AMHSSimulator:
             self.tick_count += 1
             logger.debug("--- Tick %d ---", self.tick_count)
 
-            # 1) OHT 이동 및 Failover 처리
             self.scheduler.tick(self.lots, self.tick_count, self.rng)
-
-            # 2) 방금 도착한 LOT 공정 시작 (sentinel -1 감지)
             self._start_processing_arrived_lots()
-
-            # 3) 공정 진행
             self._tick_processing_lots()
 
-            # 4) 종료 조건
             if all(lot.is_complete for lot in self.lots.values()):
                 logger.info("[tick=%d] All LOTs completed!", self.tick_count)
                 break
         else:
-            logger.warning("Simulation reached max_ticks=%d without full completion.", self.max_ticks)
+            logger.warning("Reached max_ticks=%d without full completion.", self.max_ticks)
 
         self._print_results()
 
     # ------------------------------------------------------------------ #
-    #  LOT 상태 처리                                                       #
+    #  운송 요청 (설비 점유 체크 포함)                                      #
+    # ------------------------------------------------------------------ #
+
+    def _request_transport(self, lot: Lot):
+        """
+        다음 공정 설비로 운송 요청.
+        설비가 이미 점유 중이면 equip_queue에 등록하고 대기한다.
+        """
+        if lot.is_complete:
+            return
+
+        proc = lot.current_process
+        equip_id = self._equip_assignment[lot.lot_id][proc]
+        equip = self.equipments[equip_id]
+        from_node = lot.current_position
+        to_node = equip.position
+
+        if equip.is_occupied:
+            # 설비 점유 중 → 장비 대기 큐에 추가, LOT은 WAITING 유지
+            if lot.lot_id not in self._equip_queue[equip_id]:
+                self._equip_queue[equip_id].append(lot.lot_id)
+                logger.info(
+                    "[tick=%d] %s EQUIP-WAIT for %s (occupied by %s)",
+                    self.tick_count, lot.lot_id, equip_id, equip.current_lot,
+                )
+            return
+
+        # 설비 예약 (in-transit 포함 점유로 간주)
+        equip.current_lot = lot.lot_id
+        logger.info(
+            "[tick=%d] REQUEST %s: %s -> %s (%s)",
+            self.tick_count, lot.lot_id, from_node, to_node, proc,
+        )
+        self.scheduler.assign_transport(lot, from_node, to_node, self.tick_count)
+
+    # ------------------------------------------------------------------ #
+    #  LOT 공정 처리                                                       #
     # ------------------------------------------------------------------ #
 
     def _start_processing_arrived_lots(self):
-        """scheduler가 sentinel -1로 표시한 도착 LOT의 공정 처리 시간 세팅."""
+        """scheduler가 sentinel -1로 표시한 도착 LOT의 공정 시간 초기화."""
         for lot in self.lots.values():
             if lot.status == LotStatus.PROCESSING and lot.processing_ticks_remaining == -1:
                 proc = PROCESS_SEQUENCE[lot.process_index]
                 lot.processing_ticks_remaining = PROCESS_DURATION[proc]
                 logger.info(
-                    "[tick=%d] START processing %s at %s (%s, %d ticks)",
+                    "[tick=%d] START %s at %s (%s, %d ticks)",
                     self.tick_count, lot.lot_id, lot.current_position,
                     proc, lot.processing_ticks_remaining,
                 )
 
     def _tick_processing_lots(self):
-        """공정 중인 LOT 1 tick 진행."""
         for lot in self.lots.values():
             if lot.status == LotStatus.WAITING:
                 lot.wait_ticks += 1
@@ -119,10 +150,30 @@ class AMHSSimulator:
 
     def _finish_processing(self, lot: Lot):
         completed_proc = PROCESS_SEQUENCE[lot.process_index]
+        equip_id = self._equip_assignment[lot.lot_id][completed_proc]
+        equip = self.equipments[equip_id]
+
         logger.info(
-            "[tick=%d] FINISH %s at %s (process=%s)",
+            "[tick=%d] FINISH %s at %s (%s)",
             self.tick_count, lot.lot_id, lot.current_position, completed_proc,
         )
+
+        # 설비 해제
+        equip.current_lot = None
+
+        # 장비 대기 큐에서 다음 LOT 서비스 (점유권 이전)
+        if self._equip_queue[equip_id]:
+            next_lot_id = self._equip_queue[equip_id].pop(0)
+            next_lot = self.lots[next_lot_id]
+            equip.current_lot = next_lot_id
+            logger.info(
+                "[tick=%d] EQUIP-RELEASE %s -> next: %s", self.tick_count, equip_id, next_lot_id
+            )
+            self.scheduler.assign_transport(
+                next_lot, next_lot.current_position, equip.position, self.tick_count
+            )
+
+        # 현재 LOT 공정 인덱스 전진
         lot.process_index += 1
 
         if lot.is_complete:
@@ -132,20 +183,6 @@ class AMHSSimulator:
         else:
             lot.status = LotStatus.WAITING
             self._request_transport(lot)
-
-    def _request_transport(self, lot: Lot):
-        if lot.is_complete:
-            return
-        proc = lot.current_process
-        equip_id = self._equip_assignment[lot.lot_id][proc]
-        to_node = self.equipments[equip_id].position
-        from_node = lot.current_position
-
-        logger.info(
-            "[tick=%d] REQUEST %s: %s -> %s (%s)",
-            self.tick_count, lot.lot_id, from_node, to_node, proc,
-        )
-        self.scheduler.assign_transport(lot, from_node, to_node, self.tick_count)
 
     # ------------------------------------------------------------------ #
     #  결과 출력                                                           #
@@ -192,15 +229,14 @@ class AMHSSimulator:
         print(f"\n[Failover Events]  (total={len(events)})")
         if events:
             for ev in events:
-                reassign = ev.reassigned_oht or "PENDING"
+                reassign = ev.reassigned_oht or "PENDING (no idle OHT)"
                 print(f"  tick={ev.tick:>3d} | {ev.oht_id} ERROR | {ev.lot_id} "
                       f"({ev.from_node}->{ev.to_node}) | reassigned->{reassign}")
         else:
             print("  (none)")
 
-        # ── Summary ───────────────────────────────────────────────────
         completed = sum(1 for lot in self.lots.values() if lot.is_complete)
-        print(f"\n  LOTs completed      : {completed} / {len(self.lots)}")
-        print(f"  Total sim ticks     : {self.tick_count}")
-        print(f"  Failover events     : {len(events)}")
+        print(f"\n  LOTs completed  : {completed} / {len(self.lots)}")
+        print(f"  Total sim ticks : {self.tick_count}")
+        print(f"  Failover events : {len(events)}")
         print(sep + "\n")

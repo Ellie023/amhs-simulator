@@ -6,11 +6,11 @@ from .graph import FabGraph
 
 logger = logging.getLogger("amhs.scheduler")
 
-TRANSIT_TICKS_PER_UNIT = 1   # 거리 1 단위 = 1 tick
+TRANSIT_TICKS_PER_UNIT = 1
+FAILOVER_RECOVERY_TICKS = 3   # 장애 OHT가 ERROR 상태를 유지하는 tick 수
 
 
 def _transit_ticks(distance: float) -> int:
-    """거리 → 이동 tick 수 (최소 1)."""
     return max(1, int(round(distance * TRANSIT_TICKS_PER_UNIT)))
 
 
@@ -18,8 +18,11 @@ class Scheduler:
     """
     Nearest OHT Scheduling + Failover 담당.
 
-    Transport 완료 시 lot.status = PROCESSING, lot.processing_ticks_remaining = -1 로 설정.
-    Simulator가 -1 를 감지해 공정 처리 시간을 세팅한다.
+    Transport 완료 시 lot.status = PROCESSING, lot.processing_ticks_remaining = -1.
+    Simulator가 -1 sentinel을 감지해 공정 시간을 세팅한다.
+
+    Failover 발생 시 해당 OHT는 FAILOVER_RECOVERY_TICKS 동안 ERROR 상태를 유지하며
+    Idle OHT 선택 대상에서 제외된다. 이를 통해 같은 OHT로의 자기 재할당을 방지한다.
     """
 
     def __init__(self, graph: FabGraph, ohts: Dict[str, OHT], failover_prob: float = 0.12):
@@ -34,6 +37,10 @@ class Scheduler:
     # ------------------------------------------------------------------ #
 
     def nearest_idle_oht(self, from_node: str) -> Optional[OHT]:
+        """
+        from_node 기준 가장 가까운 Idle OHT 반환.
+        ERROR/BUSY 상태 OHT는 완전히 배제된다.
+        """
         best: Optional[OHT] = None
         best_dist = float("inf")
 
@@ -52,10 +59,6 @@ class Scheduler:
     # ------------------------------------------------------------------ #
 
     def assign_transport(self, lot: Lot, from_node: str, to_node: str, tick: int) -> bool:
-        """
-        Nearest Idle OHT에 LOT 운송 할당.
-        Idle OHT 없으면 pending 큐에 추가 후 False 반환.
-        """
         oht = self.nearest_idle_oht(from_node)
         if oht is None:
             already = any(t["lot_id"] == lot.lot_id for t in self._pending_queue)
@@ -64,7 +67,7 @@ class Scheduler:
                     {"lot_id": lot.lot_id, "from_node": from_node, "to_node": to_node}
                 )
                 logger.info(
-                    "[tick=%d] No idle OHT for %s (%s->%s). Queued.",
+                    "[tick=%d] No idle OHT for %s (%s->%s). OHT-pending.",
                     tick, lot.lot_id, from_node, to_node,
                 )
             return False
@@ -101,10 +104,19 @@ class Scheduler:
     # ------------------------------------------------------------------ #
 
     def tick(self, lots: Dict[str, Lot], current_tick: int, rng) -> List[FailoverEvent]:
-        """1 tick 전진. Failover 이벤트 목록 반환."""
         new_events: List[FailoverEvent] = []
 
         for oht in list(self.ohts.values()):
+
+            # ERROR 상태 — 복구 카운트다운
+            if oht.status == OHTStatus.ERROR:
+                oht.recovery_ticks -= 1
+                if oht.recovery_ticks <= 0:
+                    oht.status = OHTStatus.IDLE
+                    oht.recovery_ticks = 0
+                    logger.info("[tick=%d] %s recovered -> IDLE", current_tick, oht.oht_id)
+                continue
+
             if oht.status != OHTStatus.BUSY or oht.current_task is None:
                 continue
 
@@ -119,11 +131,9 @@ class Scheduler:
 
             # 정상 진행
             task["ticks_remaining"] -= 1
-
             if task["ticks_remaining"] <= 0:
                 self._complete_transport(oht, lots[task["lot_id"]], task, current_tick)
 
-        # Pending 재시도
         self._retry_pending(lots, current_tick)
         return new_events
 
@@ -137,9 +147,8 @@ class Scheduler:
 
         lot.current_position = task["to_node"]
         lot.assigned_oht = None
-        # sentinel -1: simulator가 감지해 공정 시간을 세팅
         lot.status = LotStatus.PROCESSING
-        lot.processing_ticks_remaining = -1
+        lot.processing_ticks_remaining = -1   # sentinel: simulator가 공정 시간 세팅
 
         logger.info(
             "[tick=%d] DELIVERED %s -> %s (arrived %s)",
@@ -167,16 +176,18 @@ class Scheduler:
             to_node=task["to_node"],
         )
 
-        # OHT: Error → 즉시 Idle 복구 (단순화)
-        oht.status = OHTStatus.IDLE
+        # OHT: BUSY → ERROR + 복구 쿨다운
+        # 쿨다운 동안 nearest_idle_oht() 에서 이 OHT는 선택되지 않는다.
+        oht.status = OHTStatus.ERROR
+        oht.recovery_ticks = FAILOVER_RECOVERY_TICKS
         oht.current_lot = None
         oht.current_task = None
 
-        # LOT: 출발지에서 재대기
+        # LOT: 출발지에서 재대기 (설비 예약은 유지 — 목적지는 동일)
         lot.status = LotStatus.WAITING
         lot.assigned_oht = None
 
-        # 재할당 시도
+        # 다른 Idle OHT에 즉시 재할당 (장애 OHT는 ERROR이므로 자동 배제)
         alt = self.nearest_idle_oht(task["from_node"])
         if alt:
             self._do_assign(alt, lot, task["from_node"], task["to_node"], tick)
@@ -186,7 +197,9 @@ class Scheduler:
             self._pending_queue.append(
                 {"lot_id": lot.lot_id, "from_node": task["from_node"], "to_node": task["to_node"]}
             )
-            logger.warning("[tick=%d] No idle OHT for reassignment. Queued.", tick)
+            logger.warning(
+                "[tick=%d] No other idle OHT available. %s queued.", tick, lot.lot_id
+            )
 
         return ev
 
