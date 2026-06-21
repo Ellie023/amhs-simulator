@@ -195,26 +195,6 @@ while tick < max_ticks:
 
 ---
 
-## SK하이닉스 AMHS 직무와의 연관성
-
-| AMHS 실무 역량 | 시뮬레이터 구현 내용 |
-|---|---|
-| **AMHS Control** | OHT 상태(Idle/Busy/Error) 관리, Tick 기반 상태 전이 엔진 |
-| **Route Finding** | FAB 그래프 모델링 + Dijkstra 최단 경로 탐색 |
-| **Scheduling** | Nearest OHT Dispatching, Pending Queue를 통한 재스케줄링 |
-| **장애 대응 (Failover)** | 확률적 OHT 장애 시뮬레이션 + 자동 재할당 + 이벤트 이력 관리 |
-| **성능 분석** | LOT별 처리 시간·대기 시간, OHT별 이동 거리·작업 횟수 집계 |
-
-### 실무 확장 포인트
-
-- **Dispatching 고도화:** Nearest → Shortest Job First, EDF(Earliest Deadline First) 정책 비교
-- **다중 포트 지원:** 설비별 복수 I/O 포트 모델링
-- **예방 정비(PM) 스케줄:** 일정 작업 횟수 초과 시 강제 Maintenance 상태 전환
-- **실시간 대시보드:** curses 또는 Rich 라이브러리를 이용한 터미널 UI
-- **통계 수집:** 시드별 Monte Carlo 반복 실행으로 평균 처리량(Throughput) 분포 분석
-
----
-
 ## 설계 원칙
 
 - **순수 Python:** 외부 라이브러리 의존 없이 핵심 알고리즘 직접 구현
